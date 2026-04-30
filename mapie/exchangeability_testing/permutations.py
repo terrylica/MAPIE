@@ -31,7 +31,7 @@ class TestStatistic(ABC):
         raise NotImplementedError  # pragma: no cover
 
 
-class MeanShiftTestStatistic(TestStatistic):
+class MaxSplitMeanDifferenceTestStatistic(TestStatistic):
     """Maximum CUSUM-scaled mean-shift statistic on a score sequence.
 
     The statistic is the maximum, over all valid split points, of the
@@ -99,6 +99,9 @@ class PermutationTest(ABC):
         Seed controlling the randomness of permutations.
     num_permutations : int, default=1000
         Number of permutations used by permutation-based tests.
+    warn : bool, default=True
+        Whether to raise a warning when the exchangeability test fails at the
+        end of :meth:`run`.
     """
 
     def __init__(
@@ -108,6 +111,7 @@ class PermutationTest(ABC):
         task: Optional[Literal["classification", "regression"]] = None,
         random_state: Optional[int] = None,
         num_permutations: int = 1000,
+        warn: bool = True,
     ) -> None:
         if not (0.0 < test_level < 1.0):
             raise ValueError("test_level must be in (0, 1).")
@@ -118,8 +122,23 @@ class PermutationTest(ABC):
         self.task = task
         self.rng = np.random.RandomState(random_state)
         self.num_permutations = num_permutations
+        self.warn = warn
         self.p_values: NDArray = np.array([])
-        self.test_statistic = MeanShiftTestStatistic()
+        self.test_statistic = MaxSplitMeanDifferenceTestStatistic()
+
+    @property
+    def is_exchangeable(self) -> Optional[bool]:
+        """Return the latest exchangeability decision.
+
+        Returns
+        -------
+        Optional[bool]
+            ``None`` if the test has not been run yet, otherwise whether the
+            dataset is deemed exchangeable based on the last p-value.
+        """
+        if self.p_values.size == 0:
+            return None
+        return bool(self.p_values[-1] > self.test_level)
 
     @staticmethod
     def _prepare_estimator(
@@ -246,9 +265,19 @@ class PermutationTest(ABC):
         return scores
 
     @abstractmethod
-    def run(self, X: NDArray, y: NDArray) -> bool:
+    def run(self, X: NDArray, y: NDArray) -> "PermutationTest":
         """Run a permutation-based exchangeability test."""
         raise NotImplementedError  # pragma: no cover
+
+    def _warn_if_not_exchangeable(self) -> None:
+        """Raise a warning when exchangeability is rejected."""
+        if self.warn and self.is_exchangeable is False:
+            warnings.warn(
+                "Exchangeability test rejected the null hypothesis at "
+                f"test_level={self.test_level}.",
+                UserWarning,
+                stacklevel=2,
+            )
 
 
 class PValuePermutationTest(PermutationTest):
@@ -278,11 +307,14 @@ class PValuePermutationTest(PermutationTest):
         Seed controlling the randomness of permutations.
     num_permutations : int, default=1000
         Number of permutations used to estimate the p-value.
+    warn : bool, default=True
+        Whether to raise a warning when the exchangeability test fails at the
+        end of :meth:`run`.
 
     Examples
     --------
     >>> import numpy as np
-    >>> from mapie.exchangeability_testing.permutation_tests import (
+    >>> from mapie.exchangeability_testing.permutations import (
     ...     PValuePermutationTest,
     ... )
     >>> X = np.arange(100, dtype=float).reshape(-1, 1)
@@ -290,7 +322,7 @@ class PValuePermutationTest(PermutationTest):
     >>> test = PValuePermutationTest(
     ...     test_level=0.2,
     ... )
-    >>> test.run(X, y)
+    >>> test.run(X, y).is_exchangeable
     True
     """
 
@@ -301,6 +333,7 @@ class PValuePermutationTest(PermutationTest):
         task: Optional[Literal["classification", "regression"]] = None,
         random_state: Optional[int] = None,
         num_permutations: int = 1000,
+        warn: bool = True,
     ) -> None:
         super().__init__(
             test_level=test_level,
@@ -308,9 +341,10 @@ class PValuePermutationTest(PermutationTest):
             task=task,
             random_state=random_state,
             num_permutations=num_permutations,
+            warn=warn,
         )
 
-    def run(self, X: NDArray, y: NDArray) -> bool:
+    def run(self, X: NDArray, y: NDArray) -> "PValuePermutationTest":
         """Run a p-value permutation test.
 
         Parameters
@@ -321,8 +355,8 @@ class PValuePermutationTest(PermutationTest):
             Target values.
         Returns
         -------
-        bool
-            Whether the dataset is deemed exchangeable.
+        PValuePermutationTest
+            Updated instance.
         """
         scores = self._compute_non_conformity_scores(X, y)
 
@@ -341,9 +375,8 @@ class PValuePermutationTest(PermutationTest):
                 rank += 1
             self.p_values[t] = rank / (t + 1)
 
-        is_exchangeable = bool(self.p_values[-1] > self.test_level)
-
-        return is_exchangeable
+        self._warn_if_not_exchangeable()
+        return self
 
 
 class SequentialMonteCarloTest(PermutationTest):
@@ -374,6 +407,11 @@ class SequentialMonteCarloTest(PermutationTest):
         Seed controlling the randomness of permutations.
     num_permutations : int, default=1000
         Maximum number of permutations.
+    warn : bool, default=True
+        Whether to raise a warning when the exchangeability test fails at the
+        end of :meth:`run`.
+    burn_in : int, default=100
+        Minimum number of permutations before considering early stopping.
     """
 
     def __init__(
@@ -384,6 +422,8 @@ class SequentialMonteCarloTest(PermutationTest):
         task: Optional[Literal["classification", "regression"]] = None,
         random_state: Optional[int] = None,
         num_permutations: int = 1000,
+        warn: bool = True,
+        burn_in: int = 100,
     ) -> None:
         super().__init__(
             test_level=test_level,
@@ -391,8 +431,10 @@ class SequentialMonteCarloTest(PermutationTest):
             task=task,
             random_state=random_state,
             num_permutations=num_permutations,
+            warn=warn,
         )
         self.strategy = strategy
+        self.burn_in = burn_in
 
         valid_strategies = {"aggressive", "binomial", "binomial_mixture"}
         if self.strategy not in valid_strategies:
@@ -400,7 +442,7 @@ class SequentialMonteCarloTest(PermutationTest):
                 f"Unknown strategy '{self.strategy}'. Expected one of {valid_strategies}."
             )
 
-    def run(self, X: NDArray, y: NDArray) -> bool:
+    def run(self, X: NDArray, y: NDArray) -> "SequentialMonteCarloTest":
         """Run a sequential Monte Carlo permutation test.
 
         Parameters
@@ -411,8 +453,8 @@ class SequentialMonteCarloTest(PermutationTest):
             Target values.
         Returns
         -------
-        bool
-            Whether the dataset is deemed exchangeable.
+        SequentialMonteCarloTest
+            Updated instance.
         """
         scores = self._compute_non_conformity_scores(X, y)
 
@@ -459,7 +501,7 @@ class SequentialMonteCarloTest(PermutationTest):
             if (
                 current_wealth < self.test_level
                 or current_wealth >= 1 / self.test_level
-            ):
+            ) and i > self.burn_in:
                 break
 
         strategy_to_wealth = {
@@ -471,6 +513,5 @@ class SequentialMonteCarloTest(PermutationTest):
         running_max_wealth = np.maximum.accumulate(wealth_history)
         self.p_values = np.minimum(1 / running_max_wealth, 1)
 
-        is_exchangeable = bool(self.p_values[-1] > self.test_level)
-
-        return is_exchangeable
+        self._warn_if_not_exchangeable()
+        return self
